@@ -277,29 +277,72 @@ Simulating Full CWMP Chain (Synthetic Inform)...
 
 ### Step 10: Execute Stage 1
 
-Make sure Docker, Technitium, and the proxy listener from Step 8 are all still running, then list the devices GenieACS can see:
+Make sure Docker, Technitium, and the proxy listener from Step 8 are still running. The script re-checks the whole chain and can start `pass_front.py` on its own if nothing is listening, but **JHS owners must start `./jhs/run_acs.sh` first** — an auto-started proxy uses the default JMSC/JMSB certificate chain (`tls/acs_chain.pem`) and the JHS handshake will fail.
+
+#### 10.1 List the devices GenieACS can see
 
 ```bash
 ./stage1.sh --list-devices
 ```
 
-You should see two entries: the simulated test device created by `doctor.py --simulate`, and your real STB.
+This runs the quick health check first, then lists every device in GenieACS. `ONLINE` means the device phoned home within the last **15 minutes**; anything older is shown as `STALE (Xm ago)`.
+
+If exactly one device is online, the script selects it automatically:
 
 ```text
 [2/6] Finding device in GenieACS...
-  1 online, 2 total:
-    1) 000000-TEST%2DJioSTB-SIMULATED%2D9999  [STALE (25m ago)]  <-- Simulated device from doctor.py
-    2) CCF55F-JHSD200-RFLSBBII2242025          [ONLINE]           <-- Your real STB
+  Auto-selected device: CCF55F-JHSD200-RFLSBBII2242025
 ```
 
-Select your STB when prompted, then run the full script:
+If there are several (or none), you get a prompt:
 
-```bash
-./stage1.sh
+```text
+  1 online, 2 total:
+    1) 000000-TEST-JioSTB-SIMULATED-9999  [STALE (25m ago)]
+    2) CCF55F-JHSD200-RFLSBBII2242025     [ONLINE]
 ```
 
 > [!NOTE]
-> Avoid `./stage1.sh --tasks-only` for this flow; it does not work reliably. Run the full script and let it queue the tasks itself.
+> `doctor.py --simulate` deletes its simulated test device when it finishes, so a normal run shows **only your real STB**. A leftover `TEST-JioSTB-SIMULATED` entry just means an earlier cleanup failed.
+
+At the prompt, enter the device **number**, a **serial number**, or `wait` (polls for a new Inform for up to 10 minutes). You can also skip the prompt entirely with `--device <FULL_ID>` or `--serial <SN>`.
+
+#### 10.2 Run the full script (Recommended)
+
+```bash
+./stage1.sh --stb-ip 192.168.29.128
+```
+
+Use the static IP you assigned in Step 3. Without `--stb-ip` the script asks for it; you can also export `STB_IP=192.168.29.128` beforehand.
+
+What each phase does:
+
+1. `[1/6]` — checks curl, Python, ADB and the GenieACS NBI, then starts `pass_front.py` if ports 8443/9443 are not already listening (log: `tls/pass_front.log`, PID: `tls/pass_front.pid`).
+2. `[2/6]` — discovers/selects the STB.
+3. `[3/6]` — queues a full `refreshObject` so GenieACS knows every parameter.
+4. `[4/6]` — queues `USBDebugging=true`, debug validity to 2037, and `FOTA.Disable` / `FOTA.DowngradeEnable` (downgrade validity to 2037).
+5. `[5/6]` — connects to `STB_IP:5555` (retries every 5 seconds for about 5 minutes) and waits up to 120 seconds for the RSA prompt on the TV.
+6. `[6/6]` — post-setup over ADB: Developer Options, OTA services disabled (`com.jio.*` and `com.iwedia.*`), staged updates cleared, Jio Ad Service uninstalled, bundled APKs installed in priority order, Monet set as home with the stock launcher suspended/disabled, and permissions granted to Shevery/Shizuku.
+
+#### 10.3 Power-cycle at the right moment (critical)
+
+TR-069 tasks only apply during a boot Inform, so the timing matters:
+
+* **Single run:** as soon as `[5/6]` prints `Trying adb.exe connect …`, unplug the STB from the wall, wait 5 seconds, and plug it back in. The script keeps retrying for ~5 minutes, so the box normally finishes booting inside that window. Accept the RSA prompt on the TV when it appears. If the script times out, wait for the box to finish booting and re-run with `--skip-prereqs --stb-ip <IP>`.
+* **Another Approach: Two-phase (If don't want to run full script):**
+
+  ```bash
+  ./stage1.sh --tasks-only
+  # cold power-cycle the STB now, then wait for a full boot
+  ./stage1.sh --skip-prereqs --stb-ip 192.168.29.128
+  ```
+
+  `--tasks-only` queues the TR-069 tasks and exits before the ADB stage. It is a supported fallback — `jhs/run_acs.sh` suggests exactly this flow.
+
+Re-running is safe: `queue_task_once` skips tasks that are already queued. Use `./stage1.sh --tasks` to inspect the queue and `./stage1.sh --clear-tasks` to reset it.
+
+> [!NOTE]
+> A **stale** device is fine — the tasks queue up and apply on the next boot, which is why the cold power-cycle below is mandatory.
 
 > [!IMPORTANT]
 > **A cold power-cycle is mandatory (unplug the wall power):**
@@ -309,7 +352,16 @@ Select your STB when prompted, then run the full script:
 > 2. Wait 5 seconds, then plug it back in.
 > 3. Let it boot up completely.
 
-Once the STB finishes booting, it will display a prompt asking you to allow the connection. Accept it.
+> [!WARNING]
+> **Leave TR-069 enabled unless you know why you need otherwise.** The script skips disabling `com.jio.tr069client` by default. The opt-in flag `--yes-disable-tr069` also blocks remote app triggers, but on some firmware it prevents ADB port 5555 from surviving future reboots. **Never use it on JHS boxes** — their boot process uses TR-069 to re-assert `USBDebugging`.
+
+> [!NOTE]
+> **Bundled APKs are installed automatically.** Stage 1 installs every `*.apk` in the repo root except AnExplorer/Stremio, in the order Monet → Shevery/Shizuku → everything else. Keep the folder clean, and use `adb install` (see below) for anything you add later.
+
+
+#### 10.5 After a successful run
+
+`pass_front.py` is left running on purpose so the STB can keep informing; stop it with `./stage1.sh --stop` when you are done (Ctrl+C during the script stops it immediately). Then continue to Step 11 to confirm ADB and accept the key prompt.
 
 ### Step 11: Verify the ADB Connection
 
